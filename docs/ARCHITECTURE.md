@@ -1,3 +1,10 @@
+> **NOTE**: This document describes the **archived** monolith preserved in `_src.old/`,
+> not the current project. For the new architecture (split DiscordBot + Server + RabbitMQ),
+> see [`docs/ADDING_FEATURES.md`](ADDING_FEATURES.md) and `CLAUDE.md` at the repo root.
+> Old docs are kept for reference on business-logic patterns being ported feature-by-feature.
+
+---
+
 # Карта архитектуры Character Engine
 
 > Этот документ — «как код устроен, что обманчиво, что хрупко». Бизнес-логика лежит в `docs/BUSINESS_LOGIC.md`.

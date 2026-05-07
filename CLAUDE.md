@@ -4,116 +4,118 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Character Engine is a sharded Discord bot (Discord.Net 3.17, .NET 9, C#) that lets a server spawn AI-driven character webhooks backed by external chat platforms: **CharacterAI**, **SakuraAI**, **OpenRouter**, **ChubAI**. State is persisted in **PostgreSQL** via EF Core 9.
+Character Engine is a sharded Discord bot that lets a server spawn AI-driven character webhooks backed by external chat platforms (CharacterAI, SakuraAI, OpenRouter, ChubAI). The project is mid-rewrite: the current code in `src/` is the new architecture (split frontend/backend with RabbitMQ); the old monolith lives in `_src.old/` as a read-only archive.
 
-There are no tests in this repo.
+**Current architecture (in `src/`):** sharded Discord bot (Discord.Net 3.19), .NET 10, EF Core 10 + PostgreSQL, RabbitMQ.Client 7. Two runner exes — **DiscordBot** (frontend) and **Server** (backend) — communicating via RabbitMQ; both share `Core` and `DataAccess` libraries.
 
-## Submodules (mandatory before build)
+**Legacy monolith (in `_src.old/`):** preserved for behaviour reference during feature-by-feature porting. Do not edit; do not run; do not copy patterns wholesale (most are anti-patterns we're explicitly replacing).
 
-The solution references three external clients via git submodules, and the directories under `submodules/` are **empty in fresh clones**. Build will fail until they are populated:
+For the practical guide on how to add features, see [`docs/ADDING_FEATURES.md`](docs/ADDING_FEATURES.md).
+
+The four older `docs/*.md` files (`ARCHITECTURE.md`, `BUSINESS_LOGIC.md`, `CONNECTORS.md`, `CONCURRENCY.md`) describe the legacy monolith — they have a banner at the top and are kept for reference only.
+
+## Submodules
+
+Three Git submodules under `submodules/` host the upstream HTTP clients (CharacterAI, SakuraAI, OpenRouter). They are **empty in fresh clones**:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-`src/CHARACTER-ENGINE-DISCORD.sln` and `CharacterEngineDiscord.Modules.csproj` reference these by relative path — do not delete or move the `submodules/` folder.
+The current `src/` code does **not** reference them yet — they will be wired in when chat-integration features are ported. The legacy `_src.old/CharacterEngineDiscord.Modules.csproj` references them by relative path; do not delete or move the `submodules/` folder.
 
 ## Common commands
 
-All commands assume working dir `src/` unless noted.
-
 ```bash
-# Build & run via Docker (recommended; spins up Postgres + bot)
-docker compose up --build           # from repo root; reads .env
+# Build everything
+dotnet build src/CharacterEngineDiscord.slnx
 
-# Local build / run
-dotnet build CHARACTER-ENGINE-DISCORD.sln
-dotnet run --project CharacterEngineDiscord/CharacterEngineDiscord.csproj
-dotnet publish -c Release CharacterEngineDiscord/CharacterEngineDiscord.csproj -o publish
+# Run all unit tests
+dotnet test src/CharacterEngineDiscord.slnx
 
-# EF Core migrations (migrations live in the Migrator project, but the
-# startup project owns the connection string — both flags are required)
-dotnet ef migrations add <Name> \
-    --project       CharacterEngineDiscord.Migrator \
-    --startup-project CharacterEngineDiscord
-dotnet ef database update \
-    --project       CharacterEngineDiscord.Migrator \
-    --startup-project CharacterEngineDiscord
+# Run Bot or Server locally (assumes Postgres + RabbitMQ are reachable)
+dotnet run --project src/CharacterEngineDiscord.DiscordBot/CharacterEngineDiscord.DiscordBot.csproj
+dotnet run --project src/CharacterEngineDiscord.Server/CharacterEngineDiscord.Server.csproj
+
+# Full stack via Docker (Postgres + RabbitMQ + Bot + Server)
+docker compose -f src/docker-compose.yml up --build
+
+# EF Core migrations (DesignTimeAppDbContextFactory provides a stub connection string,
+# so no --startup-project is needed and no live DB connection occurs at design time)
+dotnet ef migrations add <Name> --project src/CharacterEngineDiscord.DataAccess
+dotnet ef database update      --project src/CharacterEngineDiscord.DataAccess
 ```
 
-`Program.Main` calls `Migrator.Run(...)` on startup, so pending migrations are applied automatically on boot — manual `database update` is only needed when working offline against a local DB.
+`CeDatabaseMigrationHostedService` applies pending migrations on Server startup (fail-fast). Manual `database update` is only needed when working entirely offline against a local DB.
 
-### Required runtime configuration
+## Required runtime configuration
 
-Two layers must be configured before the bot starts:
+Two layers, both per-runner:
 
-1. **Environment variables** (loaded from `.env` by docker-compose; copy `.env.example`):
-   `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`. The connection string is built in `App/Helpers/DatabaseHelper.cs` with **`Host=db`** hard-coded — that is the docker-compose service name. To run the bot outside docker, point `db` at your Postgres host (e.g. `/etc/hosts` alias) or change `DbConnectionString` directly.
-2. **`src/CharacterEngineDiscord/Settings/config.ini`** (`BotConfig` reads it at startup; copied to output via the csproj). At minimum: `BOT_TOKEN`, `ADMIN_GUILD_ID`, `ADMIN_GUILD_INVITE_LINK`, `LOGS_CHANNEL_ID`, `ERRORS_CHANNEL_ID`, `OWNER_USERS_IDS`. `BotConfig.Initialize` prefers a file starting with `env.config*` over `config*`, so you can drop in `Settings/env.config.local.ini` for a personal override without touching the tracked file.
+1. **`src/CharacterEngineDiscord.{DiscordBot,Server}/Settings/appsettings.json`** — tracked default values; `Settings/appsettings.Development.json` is gitignored for local override. Sections:
+   - `Bot` (Bot only): `Token`, `PlayingStatus`
+   - `Discord` (Bot only): `MessageCacheSize`, `ConnectionTimeoutMs`
+   - `Admin` (both): `GuildId`, `InviteLink`, `LogsChannelId`, `ErrorsChannelId`, `OwnerUserIds`
+   - `ConnectionStrings:Default` (both): standard `Host=...;Username=...;Password=...;Database=...`
+   - `RabbitMq` (both): `Host`, `Port`, `Username`, `Password`, `VirtualHost`, `PrefetchCount`, `RequestedHeartbeatSec`
+   - `Messages` (Server only): `DefaultMessagesFormatFile`, `DefaultSystemPromptFile`, `DefaultAvatarFile` — file names resolved against `AppContext.BaseDirectory/Settings/` by `MessagesOptionsPostConfigure`
+   - `RateLimit` (Bot only): `PerWindow`, `WindowSeconds`, `FirstBlockMinutes`, `SecondBlockHours`
+   - `Emoji` (Bot only): per-platform emoji strings
+   - `Serilog` (both): standard `MinimumLevel`/`Enrich`/`WriteTo` shape
+2. **`.env`** at repo root (loaded by `docker-compose`): `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `RABBITMQ_USER`, `RABBITMQ_PASSWORD`. The compose file maps these into `Section__Key` env vars (`ConnectionStrings__Default`, `RabbitMq__Username`, etc.) which override `appsettings.json` at runtime.
+
+Configuration sources are layered in `Program.cs`: `appsettings.json` → `appsettings.{Environment}.json` → environment variables → command-line.
 
 ## Architecture
 
-### Solution layout
+### Solution layout (7 projects)
 
 | Project | Role |
 |---|---|
-| `CharacterEngineDiscord` | Entry point (`OutputType=Exe`, `RootNamespace=CharacterEngine`). Hosts the Discord shard, DI container, handlers, repositories, services, slash command modules, helpers. |
-| `CharacterEngineDiscord.Domain` | EF Core entities + `AppDbContext`. **Note**: `AppDbContext`'s namespace is `CharacterEngineDiscord.Models` (not `.Domain.Models`) — keep the existing `// ReSharper disable once CheckNamespace` annotation when editing. |
-| `CharacterEngineDiscord.Migrator` | Owns the EF migrations assembly (`AppDbContext.OnConfiguring` calls `options.MigrationsAssembly("CharacterEngineDiscord.Migrator")`). `Migrator.Run` is invoked synchronously from `Program.Main`. |
-| `CharacterEngineDiscord.Modules` | One module per integration (chat / search), plus character adapters and the embedded `ChubAiClient`. Depends on the three submodule clients. |
-| `CharacterEngineDiscord.Shared` | Provider-agnostic DTOs and abstractions (`ICharacter`, `IIntegration`, `CommonCharacter*`). No EF / Discord deps — keep it that way. |
-| `submodules/{CharacterAI,OpenRouter,SakuraAI}-Net-Client` | Upstream HTTP clients for each platform. |
+| `CharacterEngineDiscord.Core` | Options POCOs (`BotOptions`, `DiscordOptions`, `AdminOptions`, `MessagesOptions`, `RateLimitOptions`, `EmojiOptions`), validators, `IDiscordLogger` + `DiscordLogEntry`, `IClock` + `SystemClock`, `TraceId`, `UserFriendlyException`. Only `Microsoft.Extensions.*` deps. |
+| `CharacterEngineDiscord.DataAccess` | `AppDbContext`, `DiscordGuild` entity (`Id/Name/OwnerId/OwnerUsername/MemberCount/IconUrl/Joined/JoinedAt/LeftAt/CreatedAt/UpdatedAt` — soft-delete via `Joined`+`LeftAt` with global query filter on `Joined`), EF migrations, `CeDatabaseMigrationHostedService` (fail-fast). EF Core 10 + Npgsql + `EFCore.NamingConventions` for snake_case + `EnableRetryOnFailure(5, 30s)`. |
+| `CharacterEngineDiscord.Contracts` | Zero-deps records: `IDomainMessage`, `IRequestMessage`, `ICommandMessage` markers; `MessageEnvelope` abstract base (`TraceId`, `MessageId`, `OccurredAt`, `MessageVersion`); concrete `*Request` (Bot→Server) and `*Command` (Server→Bot) records. |
+| `CharacterEngineDiscord.Messaging` | RabbitMQ.Client 7.x wrapper: `RabbitMqOptions`, `CeRabbitConnection` (singleton, lazy connect, automatic recovery enabled), `CeRabbitTopology` + `CeRabbitInfrastructureHostedService` (declares exchanges/queues/bindings + DLX on startup), `CeJsonMessageSerializer` (System.Text.Json + type registry), `CeMessagePublisher` (singleton long-lived `IChannel`), `ICeRequestHandler<>`/`ICeCommandHandler<>` generic interfaces, `CeRequestDispatcher`/`CeCommandDispatcher` (per-message DI scope), consumer hosted services. |
+| `CharacterEngineDiscord.DiscordBot` | exe (Discord.Net 3.19). Owns Discord I/O. Hosting: `CeDiscordBotHostedService` (login + event subs), `CeSlashCommandRegistrarHostedService` (idempotent `BulkOverwriteApplicationCommandsAsync` on admin guild). Forwarders translate gateway events to messages: `CeSlashCommandEventForwarder`, `CeGuildLifecycleEventForwarder`. Command handlers execute Discord actions: `RespondToInteractionCommandHandler` (REST followup), `ReportLogToAdminChannelCommandHandler` (channel.SendMessageAsync). Rate limiter: `CeWatchDog` + `CeWatchDogCleanupHostedService`. Logger: `CeDiscordLogger : IDiscordLogger` (publisher-based). |
+| `CharacterEngineDiscord.Server` | exe (no Discord.Net). Owns business logic + DB writes + scheduled jobs. `CeSlashCommandRouter` switches on `CommandName` → per-command handlers (`PingSlashCommandHandler`, future `*SlashCommandHandler`s). Guild-lifecycle persisters: `GuildJoinedRequestHandler`, `GuildLeftRequestHandler`. Logger: `CeDiscordLogger : IDiscordLogger` (also publisher-based — Server has no Discord.Net). Hangfire 1.8 (LGPL-3.0) wired via `AddCharacterEngineHangfire` for future scheduled jobs in `Jobs/`. |
+| `CharacterEngineDiscord.Tests` | xUnit v3 (3.2) + FluentAssertions 7.2 (last open-source major before 8.x went commercial). Hand-rolled stubs (no NSubstitute yet). 64 tests. |
 
-### Bot lifecycle (sharded)
+Dependencies: `Core` → no project refs; `DataAccess` → `Core`; `Contracts` → no project refs; `Messaging` → `Core` + `Contracts`; `DiscordBot` → `Core` + `DataAccess` + `Contracts` + `Messaging`; `Server` → same as DiscordBot minus Discord.Net deps; `Tests` → all of the above except DesignTime factory.
 
-`Program.Main` → loads NLog config → applies migrations → caches characters/users → `CharacterEngineBot.RunAsync` constructs a `DiscordShardedClient`. **Each shard gets its own `CharacterEngineBot` and DI `ServiceProvider`** (see `_instatnces` and `CongifureShard` — both names are misspelled in source; do not silently rename, they're referenced throughout). On `ShardReady`:
+### Refactor history
 
-- Handlers (`MessagesHandler`, `ButtonsHandler`, `ModalsHandler`, `SlashCommandsHandler`, `InteractionsHandler`, `SpecialCommandsHandler`, `BotAdminCommandsHandler`) and repositories are registered as **transients** and resolved per-event.
-- Only the shard that owns `ADMIN_GUILD_ID` boots `WatchDog` and `BackgroundWorker`.
-- Slash commands are registered per-guild in chunks of 5 with a 1 s/chunk throttle to avoid Discord rate limits. The admin guild gets the full set plus the explicit admin commands; other guilds initially get just `/start`, then `/disable`, then the full module set after `/start` runs.
+Major commits (chronological):
 
-### Provider integration model
+| Commit | Phase |
+|---|---|
+| `3e1fcde` | Archive monolith as `_src.old/`; scaffold .NET 10 solution |
+| `24eda69` | Phase 2: bot reaches Ready-State (DataAccess + Bootstrap + tests) |
+| `0335fa4` | Phase 1 (split): introduce Contracts + Messaging; rename exe → DiscordBot; add Server; Docker |
+| `d3a70a7` | Phase 2 (split): /ping end-to-end via RabbitMQ |
+| `002e0ec` | Phase 3 (split): GuildLifecycle + IDiscordLogger migrated to message bus |
+| `5c6d393` | Step 1: bootstrap hardening (EF retry, RMQ recovery, DI scope validation) |
+| `b1ded52` | Step 2: UserFriendlyException + global catch in CeSlashCommandRouter |
+| `325ed92` | Step 3: Hangfire integration in Server (OSS-only) |
+| `1973fbe` | Step 4: CeWatchDog rate limiter |
 
-Three concepts per platform:
+### Message bus
 
-1. **Module** (`Modules/Modules/...`): wraps the upstream client via `ModuleBase<TClient>`. Implements `IChatModule` (`CallCharacterAsync`) and/or `ISearchModule` (`SearchAsync`, `GetCharacterInfoAsync`). All four modules are exposed as singletons by `App/Services/IntegrationsHub.cs`; resolve them via `IntegrationsHub.GetChatModule(IntegrationType)` / `GetSearchModule(...)` rather than `new`-ing them.
-2. **Adapter** (`Modules/Adapters/*CharacterAdapter.cs`): maps platform DTO ↔ shared `CommonCharacter` and `ICharacter*` interfaces.
-3. **DB rows**: `*GuildIntegration` (per-guild credentials/defaults) and `*SpawnedCharacter` (a character bound to a channel + Discord webhook). Add a new provider by extending `IntegrationType` (`Shared/Enums.cs`), adding both DB types under `Domain/Models/Db/{Integrations,SpawnedCharacters}/`, registering them in `AppDbContext`, generating a migration in the Migrator project, then plugging the module into `IntegrationsHub`.
+Two direct exchanges (`ce.requests` / `ce.commands`), two durable queues, one fanout DLX (`ce.deadletter` + `ce.deadletter.q`). Routing keys: `ce.request.{kebab}` / `ce.command.{kebab}` (kebab from class name minus `Request`/`Command` suffix). Manual ack throughout, persistent messages (`delivery_mode=2`). `BasicProperties` carries `correlation_id`=`TraceId`, `message_id`=`MessageId`, `type`=class name, `headers["x-message-version"]`. Type registry in `CeJsonMessageSerializer` is bootstrapped via `services.RegisterMessage<T>()` calls (must be symmetric: Bot and Server register the same set).
 
-`OpenRouterModule` is special-cased: it builds chat history from the `CharacterChatHistory` table itself, so it takes a connection string + default system prompt at construction.
-
-### Message flow
-
-`MessagesHandler.HandleMessageAsync` dispatches every guild message:
-
-1. `WatchDog.ValidateUser` short-circuits blocked/rate-limited users (`USER_RATE_LIMIT` interactions per 30 s; escalating blocks via `USER_FIRST_BLOCK_MINUTES` → `USER_SECOND_BLOCK_HOURS`).
-2. The pre-loaded `CacheRepository.CachedCharacters` for the channel is filtered, then four call-paths run concurrently: reply-to-character, prefix match, "freewill" RNG, "hunted user" subscription.
-3. Each call goes through `CallCharacterAsync` → semaphore-guarded DB reload → optional context window build (when `EnableWideContext`/`FreewillContextSize > 0` and the call is indirect) → `IntegrationsHub.GetChatModule(...).CallCharacterAsync` → reply via the cached `DiscordWebhookClient` (`CachedWebhookClientsStorage`).
-
-Per-character settings cascade: `SpawnedCharacter.X` ?? `DiscordChannel.X` ?? `DiscordGuild.X` ?? `BotConfig.DEFAULT_X` (see `MessagesFormat` lookup in `MessagesHandler`, and the `OpenRouter*` settings in `OpenRouterModule`).
-
-### Caching layer
-
-`CacheRepository` is a transient that wraps three process-wide `ConcurrentDictionary` storages plus typed sub-storages (`CachedCharacerInfoStorage` [sic], `CachedWebhookClientsStorage`, `ActiveSearchQueriesStorage`). `BackgroundWorker.ClearCache` evicts entries older than 5–10 minutes. Webhook clients are cached because constructing `DiscordWebhookClient` performs a Discord round-trip; reuse them.
-
-### Background work & stored actions
-
-`App/Services/BackgroundWorker.cs` launches four loops on a single shard (admin shard):
-
-| Loop | Cooldown | Purpose |
-|---|---|---|
-| `RunStoredActions` | 20 s | Picks up `StoredActions` rows in `Pending`, dispatches by `StoredActionType`. Currently only `SakuraAiEnsureLogin` (polls SakuraAI for email-confirmation completion). Increment `Attempt`; cancel after `MaxAttemtps`; finalizer notifies the originating channel. |
-| `MetricsReport` | 1 h | Posts the `Metric` table delta to the logs channel. |
-| `RevalidateBlockedUsers` | 1 min | Unblocks users whose `BlockedUntil` has elapsed. |
-| `ClearCache` | 5 min | Cache eviction. |
-
-To add a new async, retryable action: add an enum case to `StoredActionType`, write a creator helper in `StoredActionsHelper`, add a `switch` arm in both `_quickJobActionTypes` filter and the dispatch `switch` inside `RunStoredActions`, and write the give-up finalizer if the user needs to be told about timeout.
+See `docs/ADDING_FEATURES.md` for the end-to-end interaction flow diagram and step-by-step recipes.
 
 ## Conventions worth preserving
 
-- **`AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true)`** is set in `Program.Main` — DB code stores `DateTime.Now` (local kind) and relies on this. New entities should follow the same pattern; do not introduce `DateTime.UtcNow` without auditing all comparisons.
-- Compile-time safety: every project enables `Nullable`, treats **`CS8509` (non-exhaustive switch) as error**, and silences `CS8524`. When you `switch` on an enum/`IntegrationType`, supply a default arm that throws `ArgumentOutOfRangeException` (the existing pattern in `IntegrationsHub`).
-- `BotConfig` settings are split between `static readonly` (require restart) and getter-properties (`=> GetParamByName<T>(...)`) which **hot-reload** from the file on every read. Choose accordingly when adding new keys.
-- Heavy paths in `MessagesHandler` use a private `SemaphoreSlim(1,1)` plus `.GetAwaiter().GetResult()` inside the lock to serialize EF calls on the per-handler `AppDbContext`. Don't switch them to `await` inside the lock without rethinking the contention model.
-- Discord errors that should reach the user surface as `UserFriendlyException` (`App/Exceptions`); `MessagesHandler` and the global `UnobservedTaskException` hook silence them.
-- Logging uses the `_log` instance per class; admin alerts go through `DiscordSocketClient.ReportLogAsync` / `ReportErrorAsync` extensions in `App/Helpers/Discord`.
+- **`AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true)`** is set as the first line of `CeDatabaseMigrationHostedService.StartAsync` (Server-side, before any DbContext is opened). DB code stores `DateTime.Now` (local kind) and relies on this. Don't introduce `DateTime.UtcNow` for stored timestamps without auditing all comparisons. (`OccurredAt` in message envelopes is UTC — that's a separate, in-flight contract concern, not stored in DB.)
+- **Compile-time safety:** every project enables `Nullable`, treats **`CS8509` (non-exhaustive switch) as error**, and silences `CS8524`. When you `switch` on an enum, exhaustive matching is required (no default arm needed if all values are covered). Configured in `src/Directory.Build.props`.
+- **Codestyle in `src/.editorconfig`:** file-scoped namespaces, Allman braces (control flow) / end-of-line braces (initializers), force braces on every if/else/etc., var everywhere, `_camelCase` private fields, `I` prefix interfaces, `T` prefix type parameters. **`Ce` prefix** for our custom services (`CeWatchDog`, `CeMessagePublisher`, `CeSlashCommandRouter`, etc.); **no prefix** for contracts / records / entities / exceptions / Options / handlers.
+- **Contracts naming:** inbound (Bot→Server) is always `*Request`; outbound (Server→Bot) is always `*Command`. Strict.
+- **`DeferAsync` BEFORE `PublishRequestAsync`** in any interaction forwarder. Discord allows 3 seconds to ack; RabbitMQ publish can take longer than that under load. Forwarder structure: rate-limit check → DeferAsync → publish.
+- **Manual ack everywhere.** Successful handler → `BasicAckAsync`. Handler exception → `BasicNackAsync(requeue: true)`. Unknown message type → `BasicNackAsync(requeue: false)` → DLX. **TODO Phase 4:** dedup by `MessageEnvelope.MessageId` (markers in both consumer hosted services).
+- **`UserFriendlyException`** for known business errors that should be shown to the user verbatim. `CeSlashCommandRouter` catches it, publishes an ephemeral `RespondToInteractionCommand`, and acks — no requeue. Any *other* exception requeues (use this pattern only for transient / programming bugs).
+- **`IDiscordLogger.ReportAsync`** for all admin-channel notifications. Both Bot and Server inject `IDiscordLogger`; both implementations publish `ReportLogToAdminChannelCommand` to the bus — single executor (`ReportLogToAdminChannelCommandHandler` in Bot) actually calls `channel.SendMessageAsync`. Severity ≥ Error → `ErrorsChannelId`; otherwise → `LogsChannelId`.
+- **`ICeWatchDog.Check`** runs in every interaction forwarder before `DeferAsync`. It's automatic; don't add custom rate-limiting. Owners listed in `AdminOptions.OwnerUserIds` are bypassed. Admin notification fires exactly once per ban transition (`RateLimitDecision.JustBlocked`). Persistence of blocks across bot restarts is a TODO documented in `CeWatchDog.cs`.
+- **`TraceId.New()`** at the entry of each forwarder; propagate through `MessageEnvelope.TraceId` for end-to-end log correlation.
+- **DI scope validation:** Bot and Server both enable `ValidateScopes = true` + `ValidateOnBuild = true` via `builder.ConfigureContainer(new DefaultServiceProviderFactory(new ServiceProviderOptions { ... }))`. **Important:** `builder.Services.Configure<ServiceProviderOptions>(...)` is **silently ignored** by `HostApplicationBuilder` — the options are captured at construction time, not re-resolved at `Build()`. Always use `ConfigureContainer` for this.
+- **Bot does not write to DB.** Reads are fine; writes go through the bus and are executed by Server. Single source of truth simplifies cross-process consistency.
+- **All slash commands are guild-scoped, not global** (registered via `guild.BulkOverwriteApplicationCommandsAsync`). Global commands have a 1-hour propagation delay; we don't use them.
