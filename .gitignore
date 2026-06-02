@@ -8,3 +8,6 @@
 *.env
 env.*
 .vs/
+.env
+**/appsettings.Development.json
+**/appsettings.Local.json
