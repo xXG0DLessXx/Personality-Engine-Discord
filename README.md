@@ -43,13 +43,17 @@
      mv .env.example .env
      ```
    - Open the `.env` file and fill in the required values:
-     - **DB Name**: Choose a name for your database.
-     - **DB User**: Set a username for database access.
-     - **DB Password**: Create a secure password for the database.
+     - **Postgres DB Name**: Choose a name for your database.
+     - **Postgres User**: Set a username for database access.
+     - **Postgres Password**: Create a secure password for the database.
+     - **RabbitMQ User**: Set a RabbitMQ username.
+     - **RabbitMQ Password**: Set a RabbitMQ password.
 
 3. **Set Up Configuration Files**
-   - Go to the `src/CharacterEngineDiscord/Settings` directory.
-   - Open the `config` file and complete any required values. Alternatively, create a new `env.config` file based on `config` but customized with your specific settings.
+   - Configure per-runner settings in:
+     - `src/CharacterEngineDiscord.DiscordBot/Settings/appsettings.json`
+     - `src/CharacterEngineDiscord.Server/Settings/appsettings.json`
+   - For local overrides, create `appsettings.Development.json` in the same settings folders.
 
 4. **Install Docker (If Needed)**
    - Ensure you have Docker installed. Note that running this on **Windows** is untested and may require **WSL with Docker** installed.
@@ -57,7 +61,7 @@
 5. **Start the Application**
    - Open a terminal in the root of the project directory and run:
      ```bash
-     docker compose up
+     docker compose -f src/docker-compose.yml up --build
      ```
    
    This command will build and launch the application in Docker.
